@@ -199,6 +199,8 @@ query Governors($input: GovernorsInput!) {
           proposalThreshold
           votingDelay
           votingPeriod
+          nomineeVettingDuration
+          fullWeightDuration
         }
       }
     }

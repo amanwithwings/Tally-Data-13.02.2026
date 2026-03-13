@@ -6,7 +6,7 @@ as both JSON and CSV files.
 
 Usage:
     pip install -r requirements.txt
-    echo "TALLY_API_KEY=your_key_here" > .env
+    echo "TALLY_API_KEY=8e15078bcf09864ce8a19d74c964e945eca0fe0ec7cd8a02d39e17381b4585e9" > .env
     python download_tally_data.py [--org arbitrum]
 
 Output:

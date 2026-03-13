@@ -169,28 +169,40 @@ Q_GOVERNORS = """
 query Governors($input: GovernorsInput!) {
   governors(input: $input) {
     nodes {
-      id
-      name
-      slug
-      type
-      chainId
-      quorum
-      timelockId
-      tokenId
-      proposalThreshold
-      parametersV2 {
-        quorumVotes
-        proposalThreshold
-        votingDelay
-        votingPeriod
-      }
-      contracts {
-        governor { address }
-        token { address }
-        timelock { address }
+      ... on Governor {
+        id
+        chainId
+        name
+        slug
+        type
+        kind
+        isPrimary
+        quorum
+        delegatesCount
+        delegatesVotesCount
+        tokenOwnersCount
+        token {
+          id
+          name
+          symbol
+          supply
+          decimals
+        }
+        proposalStats {
+          total
+          active
+          failed
+          passed
+        }
+        parameters {
+          quorumVotes
+          proposalThreshold
+          votingDelay
+          votingPeriod
+        }
       }
     }
-    pageInfo { firstCursor lastCursor }
+    pageInfo { firstCursor lastCursor count }
   }
 }
 """
@@ -199,39 +211,41 @@ Q_PROPOSALS = """
 query Proposals($input: ProposalsInput!) {
   proposals(input: $input) {
     nodes {
-      id
-      title
-      description
-      status
-      createdAt
-      startBlock
-      endBlock
-      eta
-      quorum
-      voteStats {
-        type
-        votesCount
-        votersCount
-        percent
-      }
-      proposer {
-        address
-        ens
-        name
-      }
-      governor {
+      ... on Proposal {
         id
-        name
-        slug
-      }
-      executableCalls {
-        target
-        value
-        calldata
-        signature
+        title
+        description
+        status
+        createdAt
+        startBlock
+        endBlock
+        eta
+        quorum
+        voteStats {
+          type
+          votesCount
+          votersCount
+          percent
+        }
+        proposer {
+          address
+          ens
+          name
+        }
+        governor {
+          id
+          name
+          slug
+        }
+        executableCalls {
+          target
+          value
+          calldata
+          signature
+        }
       }
     }
-    pageInfo { firstCursor lastCursor }
+    pageInfo { firstCursor lastCursor count }
   }
 }
 """
@@ -240,27 +254,29 @@ Q_VOTES = """
 query Votes($input: VotesInput!) {
   votes(input: $input) {
     nodes {
-      id
-      amount
-      type
-      reason
-      txHash
-      isBridged
-      block {
-        number
-        timestamp
-      }
-      voter {
-        address
-        ens
-        name
-      }
-      proposal {
+      ... on OnchainVote {
         id
-        title
+        amount
+        type
+        reason
+        txHash
+        isBridged
+        block {
+          number
+          timestamp
+        }
+        voter {
+          address
+          ens
+          name
+        }
+        proposal {
+          id
+          title
+        }
       }
     }
-    pageInfo { firstCursor lastCursor }
+    pageInfo { firstCursor lastCursor count }
   }
 }
 """
@@ -269,25 +285,27 @@ Q_DELEGATES = """
 query Delegates($input: DelegatesInput!) {
   delegates(input: $input) {
     nodes {
-      id
-      votesCount
-      delegatorsCount
-      isPrioritized
-      account {
-        address
-        ens
-        name
-        bio
-        twitter
-        picture
-      }
-      statement {
-        statement
-        isSeekingDelegation
-        updatedAt
+      ... on Delegate {
+        id
+        votesCount
+        delegatorsCount
+        isPrioritized
+        account {
+          address
+          ens
+          name
+          bio
+          twitter
+          picture
+        }
+        statement {
+          statement
+          isSeekingDelegation
+          updatedAt
+        }
       }
     }
-    pageInfo { firstCursor lastCursor }
+    pageInfo { firstCursor lastCursor count }
   }
 }
 """
@@ -296,37 +314,39 @@ Q_DELEGATIONS = """
 query Delegations($input: DelegationsInput!) {
   delegations(input: $input) {
     nodes {
-      blockNumber
-      blockTimestamp
-      chainId
-      delegator { address ens name }
-      delegate { address ens name }
-      token { id symbol decimals }
-      votes
+      ... on Delegation {
+        blockNumber
+        blockTimestamp
+        chainId
+        delegator { address ens name }
+        delegate { address ens name }
+        token { id symbol decimals }
+        votes
+      }
     }
-    pageInfo { firstCursor lastCursor }
+    pageInfo { firstCursor lastCursor count }
   }
 }
 """
 
 Q_TOKENS = """
-query Tokens($ids: [ID!]!) {
-  tokens(ids: $ids) {
-    id
-    type
-    name
-    symbol
-    decimals
-    supply
-    lastIndexedBlock {
-      number
-      timestamp
+query Tokens($input: TokensInput!) {
+  tokens(input: $input) {
+    nodes {
+      ... on Token {
+        id
+        name
+        symbol
+        decimals
+        supply
+        isIndexing
+        lastIndexedBlock {
+          number
+          timestamp
+        }
+      }
     }
-    isIndexing
-    eligibility {
-      status
-      type
-    }
+    pageInfo { firstCursor lastCursor count }
   }
 }
 """
@@ -440,8 +460,11 @@ def export_tokens(org: dict) -> list:
         save_json([], "tokens.json")
         return []
 
-    data = gql_query(Q_TOKENS, {"ids": token_ids})
-    tokens = data.get("tokens", [])
+    tokens = paginate(
+        Q_TOKENS,
+        {"input": {"filters": {"organizationId": org["id"]}}},
+        "tokens",
+    )
     save_json(tokens, "tokens.json")
     print(f"  Total tokens: {len(tokens)}")
     return tokens

@@ -4,6 +4,8 @@ Tally.xyz Data Export — Arbitrum DAO
 Downloads all governance data from the Tally.xyz GraphQL API and saves it
 as both JSON and CSV files.
 
+Based on the official Tally API docs at https://apidocs.tally.xyz/
+
 Usage:
     pip install -r requirements.txt
     echo "TALLY_API_KEY=your_key_here" > .env
@@ -37,8 +39,8 @@ if not API_KEY:
 
 ENDPOINT = "https://api.tally.xyz/query"
 HEADERS = {"Api-Key": API_KEY, "Content-Type": "application/json"}
-PAGE_SIZE = 20          # max per page per Tally docs
-RATE_LIMIT_SLEEP = 1.1  # seconds between requests (free tier: ~1 req/sec)
+PAGE_SIZE = 20
+RATE_LIMIT_SLEEP = 1.1
 
 OUT_JSON = Path("output/json")
 OUT_CSV = Path("output/csv")
@@ -51,7 +53,7 @@ OUT_CSV.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def gql_query(query: str, variables: dict, retries: int = 3) -> dict:
-    """Execute a GraphQL query with retry on rate-limit / server errors."""
+    """Execute a GraphQL query with retry + error body logging."""
     delay = 2
     for attempt in range(retries + 1):
         try:
@@ -68,9 +70,21 @@ def gql_query(query: str, variables: dict, retries: int = 3) -> dict:
                     delay *= 2
                     continue
                 resp.raise_for_status()
+
+            # For 422 errors, print the response body for debugging
+            if resp.status_code == 422:
+                print(f"  [422 error] Response body: {resp.text[:500]}")
+                if attempt < retries:
+                    print(f"  [retry {attempt+1}/{retries}] waiting {delay}s...")
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                resp.raise_for_status()
+
             resp.raise_for_status()
             data = resp.json()
             if "errors" in data:
+                print(f"  [GraphQL errors] {json.dumps(data['errors'], indent=2)[:500]}")
                 raise ValueError(f"GraphQL errors: {data['errors']}")
             return data["data"]
         except requests.RequestException as e:
@@ -84,31 +98,22 @@ def gql_query(query: str, variables: dict, retries: int = 3) -> dict:
 
 
 def paginate(query: str, variables: dict, nodes_path: str) -> list:
-    """
-    Iterate through all pages of a paginated GraphQL query.
-    nodes_path: dot-separated key path to the paginated object, e.g. "proposals"
-    Returns accumulated list of all nodes.
-    """
+    """Iterate through all pages of a paginated query."""
     all_nodes = []
     after_cursor = None
     page = 0
 
     while True:
-        vars_copy = dict(variables)
-        # Inject pagination into the input object if present, else top-level
+        vars_copy = json.loads(json.dumps(variables))  # deep copy
         if "input" in vars_copy:
-            vars_copy["input"] = dict(vars_copy["input"])
-            vars_copy["input"]["page"] = {"limit": PAGE_SIZE}
+            if "page" not in vars_copy["input"]:
+                vars_copy["input"]["page"] = {}
+            vars_copy["input"]["page"]["limit"] = PAGE_SIZE
             if after_cursor:
                 vars_copy["input"]["page"]["afterCursor"] = after_cursor
-        else:
-            vars_copy["limit"] = PAGE_SIZE
-            if after_cursor:
-                vars_copy["afterCursor"] = after_cursor
 
         data = gql_query(query, vars_copy)
 
-        # Navigate to the paginated object
         obj = data
         for key in nodes_path.split("."):
             obj = obj[key]
@@ -149,10 +154,11 @@ def save_csv(data: list, filename: str):
 
 
 # ---------------------------------------------------------------------------
-# GraphQL queries
+# GraphQL queries — aligned with https://apidocs.tally.xyz/
 # ---------------------------------------------------------------------------
 
-Q_ORG_BY_SLUG = """
+# 1. Organization — simple single-object query
+Q_ORG = """
 query Organization($input: OrganizationInput!) {
   organization(input: $input) {
     id
@@ -161,10 +167,21 @@ query Organization($input: OrganizationInput!) {
     chainIds
     tokenIds
     governorIds
+    metadata {
+      color
+      description
+      icon
+    }
+    hasActiveProposals
+    proposalsCount
+    delegatesCount
+    delegatesVotesCount
+    tokenOwnersCount
   }
 }
 """
 
+# 2. Governors — paginated, uses inline fragment on Governor
 Q_GOVERNORS = """
 query Governors($input: GovernorsInput!) {
   governors(input: $input) {
@@ -199,6 +216,13 @@ query Governors($input: GovernorsInput!) {
           proposalThreshold
           votingDelay
           votingPeriod
+          gracePeriod
+          quorumNumerator
+          quorumDenominator
+          clockMode
+        }
+        metadata {
+          description
         }
       }
     }
@@ -207,20 +231,39 @@ query Governors($input: GovernorsInput!) {
 }
 """
 
+# 3. Proposals — paginated, uses inline fragment on Proposal
+#    Fields match the Proposal type in the docs exactly
 Q_PROPOSALS = """
 query Proposals($input: ProposalsInput!) {
   proposals(input: $input) {
     nodes {
       ... on Proposal {
         id
-        title
-        description
+        onchainId
+        chainId
         status
-        createdAt
-        startBlock
-        endBlock
-        eta
         quorum
+        block {
+          number
+          timestamp
+        }
+        start {
+          ... on Block { number timestamp }
+          ... on BlocklessTimestamp { timestamp }
+        }
+        end {
+          ... on Block { number timestamp }
+          ... on BlocklessTimestamp { timestamp }
+        }
+        metadata {
+          title
+          description
+          eta
+          ipfsHash
+          discourseURL
+          snapshotURL
+          txHash
+        }
         voteStats {
           type
           votesCount
@@ -228,6 +271,11 @@ query Proposals($input: ProposalsInput!) {
           percent
         }
         proposer {
+          address
+          ens
+          name
+        }
+        creator {
           address
           ens
           name
@@ -242,6 +290,18 @@ query Proposals($input: ProposalsInput!) {
           value
           calldata
           signature
+          chainId
+          index
+          type
+        }
+        events {
+          type
+          txHash
+          createdAt
+          block {
+            number
+            timestamp
+          }
         }
       }
     }
@@ -250,6 +310,7 @@ query Proposals($input: ProposalsInput!) {
 }
 """
 
+# 4. Votes — paginated, uses inline fragment on OnchainVote
 Q_VOTES = """
 query Votes($input: VotesInput!) {
   votes(input: $input) {
@@ -272,7 +333,10 @@ query Votes($input: VotesInput!) {
         }
         proposal {
           id
-          title
+          onchainId
+          metadata {
+            title
+          }
         }
       }
     }
@@ -281,6 +345,7 @@ query Votes($input: VotesInput!) {
 }
 """
 
+# 5. Delegates — paginated, uses inline fragment on Delegate
 Q_DELEGATES = """
 query Delegates($input: DelegatesInput!) {
   delegates(input: $input) {
@@ -300,7 +365,19 @@ query Delegates($input: DelegatesInput!) {
         }
         statement {
           statement
+          statementSummary
           isSeekingDelegation
+        }
+        labels {
+          id
+          name
+          shortName
+          isFeatured
+        }
+        delegateEligibility {
+          score
+          type
+          status
           updatedAt
         }
       }
@@ -310,17 +387,33 @@ query Delegates($input: DelegatesInput!) {
 }
 """
 
-Q_DELEGATIONS = """
-query Delegations($input: DelegationsInput!) {
-  delegations(input: $input) {
+# 6. Delegators — paginated list of who delegates TO a given address
+#    The API has "delegators" (who delegates to X) and "delegatees" (who X delegates to)
+#    We fetch delegators for top delegates to build the delegation graph
+Q_DELEGATORS = """
+query Delegators($input: DelegationsInput!) {
+  delegators(input: $input) {
     nodes {
       ... on Delegation {
+        id
         blockNumber
         blockTimestamp
         chainId
-        delegator { address ens name }
-        delegate { address ens name }
-        token { id symbol decimals }
+        delegator {
+          address
+          ens
+          name
+        }
+        delegate {
+          address
+          ens
+          name
+        }
+        token {
+          id
+          symbol
+          decimals
+        }
         votes
       }
     }
@@ -329,24 +422,18 @@ query Delegations($input: DelegationsInput!) {
 }
 """
 
-Q_TOKENS = """
-query Tokens($input: TokensInput!) {
-  tokens(input: $input) {
-    nodes {
-      ... on Token {
-        id
-        name
-        symbol
-        decimals
-        supply
-        isIndexing
-        lastIndexedBlock {
-          number
-          timestamp
-        }
-      }
-    }
-    pageInfo { firstCursor lastCursor count }
+# 7. Single token query (not paginated)
+Q_TOKEN = """
+query Token($input: TokenInput!) {
+  token(input: $input) {
+    id
+    type
+    name
+    symbol
+    supply
+    decimals
+    isIndexing
+    isBehind
   }
 }
 """
@@ -358,7 +445,7 @@ query Tokens($input: TokensInput!) {
 
 def export_organization(org_slug: str) -> dict:
     print(f"\n[1/7] Fetching organization: {org_slug}")
-    data = gql_query(Q_ORG_BY_SLUG, {"input": {"slug": org_slug}})
+    data = gql_query(Q_ORG, {"input": {"slug": org_slug}})
     org = data.get("organization")
     if not org:
         sys.exit(f"ERROR: Organization '{org_slug}' not found on Tally.")
@@ -369,18 +456,13 @@ def export_organization(org_slug: str) -> dict:
 
 def export_governors(org: dict) -> list:
     print(f"\n[2/7] Fetching governors for org {org['id']}")
-    gov_ids = org.get("governorIds", [])
-    if not gov_ids:
-        print("  No governors found.")
-        save_json([], "governors.json")
-        return []
-
     governors = paginate(
         Q_GOVERNORS,
         {"input": {"filters": {"organizationId": org["id"]}}},
         "governors",
     )
     save_json(governors, "governors.json")
+    save_csv(governors, "governors.csv")
     print(f"  Total governors: {len(governors)}")
     return governors
 
@@ -402,15 +484,22 @@ def export_votes(proposals: list) -> list:
     print(f"\n[4/7] Fetching votes for {len(proposals)} proposals")
     all_votes = []
     for i, proposal in enumerate(proposals, 1):
-        proposal_id = proposal["id"]
-        proposal_title = proposal.get("title", "")[:60]
-        print(f"  [{i}/{len(proposals)}] Proposal {proposal_id}: {proposal_title}")
+        proposal_id = proposal.get("id")
+        title = ""
+        meta = proposal.get("metadata")
+        if meta and isinstance(meta, dict):
+            title = (meta.get("title") or "")[:60]
+        print(f"  [{i}/{len(proposals)}] Proposal {proposal_id}: {title}")
         try:
             votes = paginate(
                 Q_VOTES,
-                {"input": {"filters": {"proposalId": proposal_id}}},
+                {"input": {"filters": {"proposalId": str(proposal_id)}}},
                 "votes",
             )
+            # Tag each vote with the proposal id for easier joining later
+            for v in votes:
+                v["_proposal_id"] = proposal_id
+                v["_proposal_title"] = title
             all_votes.extend(votes)
         except Exception as e:
             print(f"  WARNING: Failed to fetch votes for proposal {proposal_id}: {e}")
@@ -435,24 +524,54 @@ def export_delegates(org: dict) -> list:
     return delegates
 
 
-def export_delegations(org: dict) -> list:
-    print(f"\n[6/7] Fetching delegations for org {org['id']}")
-    try:
-        delegations = paginate(
-            Q_DELEGATIONS,
-            {"input": {"filters": {"organizationId": org["id"]}}},
-            "delegations",
-        )
-        save_json(delegations, "delegations.json")
-        print(f"  Total delegations: {len(delegations)}")
-        return delegations
-    except Exception as e:
-        print(f"  WARNING: Delegations export failed: {e}")
-        save_json([], "delegations.json")
-        return []
+def export_delegations(org: dict, delegates: list) -> list:
+    """
+    Fetch delegator relationships for the top delegates.
+    The Tally API doesn't have a bulk 'delegations' query — you query
+    delegators per address. We fetch for top 50 delegates by votesCount.
+    """
+    print(f"\n[6/7] Fetching delegations (top delegate relationships)")
+
+    # Sort delegates by votesCount descending, take top 50
+    sorted_delegates = sorted(
+        delegates,
+        key=lambda d: int(d.get("votesCount") or 0),
+        reverse=True,
+    )
+    top_delegates = sorted_delegates[:50]
+
+    all_delegations = []
+    for i, delegate in enumerate(top_delegates, 1):
+        addr = delegate.get("account", {}).get("address", "")
+        name = delegate.get("account", {}).get("name", "") or delegate.get("account", {}).get("ens", "")
+        votes = delegate.get("votesCount", "?")
+        print(f"  [{i}/{len(top_delegates)}] {name or addr[:12]}... (votes: {votes})")
+
+        if not addr:
+            continue
+
+        try:
+            delegators = paginate(
+                Q_DELEGATORS,
+                {"input": {"filters": {"address": addr, "organizationId": org["id"]}}},
+                "delegators",
+            )
+            for d in delegators:
+                d["_delegate_address"] = addr
+                d["_delegate_name"] = name
+            all_delegations.extend(delegators)
+        except Exception as e:
+            print(f"  WARNING: Failed for {addr}: {e}")
+            continue
+
+    save_json(all_delegations, "delegations.json")
+    save_csv(all_delegations, "delegations.csv")
+    print(f"  Total delegation relationships: {len(all_delegations)}")
+    return all_delegations
 
 
 def export_tokens(org: dict) -> list:
+    """Fetch token info using the single-token query for each tokenId."""
     print(f"\n[7/7] Fetching token info")
     token_ids = org.get("tokenIds", [])
     if not token_ids:
@@ -460,11 +579,17 @@ def export_tokens(org: dict) -> list:
         save_json([], "tokens.json")
         return []
 
-    tokens = paginate(
-        Q_TOKENS,
-        {"input": {"filters": {"organizationId": org["id"]}}},
-        "tokens",
-    )
+    tokens = []
+    for tid in token_ids:
+        print(f"  Fetching token: {tid}")
+        try:
+            data = gql_query(Q_TOKEN, {"input": {"id": tid}})
+            token = data.get("token")
+            if token:
+                tokens.append(token)
+        except Exception as e:
+            print(f"  WARNING: Failed to fetch token {tid}: {e}")
+
     save_json(tokens, "tokens.json")
     print(f"  Total tokens: {len(tokens)}")
     return tokens
@@ -480,9 +605,9 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print(f"Tally.xyz Data Export")
+    print("Tally.xyz Data Export")
     print(f"Org: {args.org}")
-    print(f"Output: {OUT_JSON.parent.resolve()}/")
+    print(f"Output: {Path('output').resolve()}/")
     print("=" * 60)
 
     start = time.time()
@@ -492,7 +617,7 @@ def main():
     proposals = export_proposals(org)
     votes = export_votes(proposals)
     delegates = export_delegates(org)
-    delegations = export_delegations(org)
+    delegations = export_delegations(org, delegates)
     tokens = export_tokens(org)
 
     elapsed = time.time() - start

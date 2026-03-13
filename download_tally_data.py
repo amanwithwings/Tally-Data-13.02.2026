@@ -153,24 +153,14 @@ def save_csv(data: list, filename: str):
 # ---------------------------------------------------------------------------
 
 Q_ORG_BY_SLUG = """
-query OrgBySlug($slug: String!) {
-  organizationBySlug(slug: $slug) {
+query Organization($input: OrganizationInput!) {
+  organization(input: $input) {
     id
     name
     slug
     chainIds
     tokenIds
     governorIds
-    proposalsCount
-    delegatesCount
-    delegatesVotesCount
-    tokenOwnersCount
-    hasActiveProposals
-    metadata {
-      description
-      icon
-      color
-    }
   }
 }
 """
@@ -348,12 +338,12 @@ query Tokens($ids: [ID!]!) {
 
 def export_organization(org_slug: str) -> dict:
     print(f"\n[1/7] Fetching organization: {org_slug}")
-    data = gql_query(Q_ORG_BY_SLUG, {"slug": org_slug})
-    org = data.get("organizationBySlug")
+    data = gql_query(Q_ORG_BY_SLUG, {"input": {"slug": org_slug}})
+    org = data.get("organization")
     if not org:
         sys.exit(f"ERROR: Organization '{org_slug}' not found on Tally.")
     save_json(org, "organization.json")
-    print(f"  org id={org['id']} proposals={org.get('proposalsCount')} delegates={org.get('delegatesCount')}")
+    print(f"  org id={org['id']} governors={len(org.get('governorIds') or [])} tokens={len(org.get('tokenIds') or [])}")
     return org
 
 
